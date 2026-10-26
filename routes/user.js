@@ -213,4 +213,142 @@ router.get("/me", authMiddleware, async (req, res) => {
     }
 });
 
+
+const paymentPinSchema = z.object({
+    password: z.string().min(1),
+    pin: z.string().regex(/^\d{4,6}$/, "PIN must contain 4 to 6 digits")
+});
+
+router.post("/payment-pin", authMiddleware, async (req, res) => {
+    const parsed = paymentPinSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: "Enter your account password and a valid 4–6 digit PIN"
+        });
+    }
+
+    try {
+        const { password, pin } = parsed.data;
+
+        const user = await User.findById(req.userId)
+            .select("+paymentPinHash");
+
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const passwordMatches = await bcrypt.compare(
+            password,
+            user.passwordHash
+        );
+
+        if (!passwordMatches) {
+            return res.status(401).json({
+                error: "Incorrect account password"
+            });
+        }
+
+        if (user.paymentPinHash) {
+            return res.status(409).json({
+                error: "Payment PIN is already set"
+            });
+        }
+
+        const paymentPinHash = await bcrypt.hash(pin, 10);
+
+        // Atomic condition prevents concurrent requests from setting
+        // the initial PIN more than once.
+        const updatedUser = await User.findOneAndUpdate(
+            {
+                _id: req.userId,
+                $or: [
+                    { paymentPinHash: null },
+                    { paymentPinHash: { $exists: false } }
+                ]
+            },
+            {
+                $set: {
+                    paymentPinHash,
+                    pinFailedAttempts: 0,
+                    pinLockedUntil: null
+                }
+            },
+            { new: true }
+        );
+
+        if (!updatedUser) {
+            return res.status(409).json({
+                error: "Payment PIN is already set"
+            });
+        }
+
+        return res.status(201).json({
+            message: "Payment PIN set successfully"
+        });
+    } catch (error) {
+        console.error("Payment PIN setup error:", error);
+        return res.status(500).json({
+            error: "Could not set payment PIN"
+        });
+    }
+});
+
+
+
+const { verifyPaymentPin } = require("../services/paymentPin");
+
+router.post("/payment-pin/verify", authMiddleware, async (req, res) => {
+    const schema = z.object({
+        pin: z.string().regex(/^\d{4,6}$/)
+    });
+
+    const parsed = schema.safeParse(req.body);
+
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: "Enter a valid 4–6 digit PIN"
+        });
+    }
+
+    try {
+        const result = await verifyPaymentPin(req.userId, parsed.data.pin);
+
+        if (result.ok) {
+            return res.status(200).json({
+                message: "Payment PIN verified successfully"
+            });
+        }
+
+        if (result.status === "PIN_NOT_SET") {
+            return res.status(400).json({
+                error: "Set your payment PIN first"
+            });
+        }
+
+        if (result.status === "PIN_LOCKED") {
+            return res.status(423).json({
+                error: "Payment PIN is temporarily locked",
+                retryAfterSeconds: result.retryAfterSeconds
+            });
+        }
+
+        if (result.status === "PIN_RETRY") {
+            return res.status(409).json({
+                error: "PIN verification conflicted with another request. Try again."
+            });
+        }
+
+        return res.status(401).json({
+            error: "Incorrect payment PIN",
+            attemptsRemaining: result.attemptsRemaining
+        });
+    } catch (error) {
+        console.error("Payment PIN verification error:", error);
+        return res.status(500).json({
+            error: "Could not verify payment PIN"
+        });
+    }
+});
+
 module.exports = router;

@@ -1,8 +1,10 @@
+
 const express = require("express");
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { z } = require("zod");
 const Razorpay = require("razorpay");
+const { getIndiaDayKey } = require("../utils/indiaDate");
 const {
     User,
     Wallet,
@@ -10,25 +12,37 @@ const {
     LedgerEntry,
     IdempotencyRecord,
     PaymentOrder,
-    BankAccount
+    BankAccount,
+    DailyTransferLimit
 } = require("../db");
 
 const authMiddleware = require("../middleware/auth");
+const { verifyPaymentPin } = require("../services/paymentPin");
+
 const router = express.Router();
+
 const razorpay = new Razorpay({
     key_id: process.env.RAZORPAY_KEY_ID,
     key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
-// Create a Razorpay order for adding money to the wallet
+const DAILY_TRANSFER_LIMIT = 1_000_000; // ₹10,000 in paise
+
+
+function createHttpError(status, message) {
+    const error = new Error(message);
+    error.status = status;
+    return error;
+}
+
+// --------------------------------------------------
+// ADD MONEY: CREATE RAZORPAY ORDER
+// --------------------------------------------------
+
 router.post("/add-money/order", authMiddleware, async (req, res) => {
     try {
-        const amountSchema = z.number()
-            .int()
-            .min(1000)
-            .max(1000000);
-
-        const result = amountSchema.safeParse(req.body.amount);
+        const amountSchema = z.number().int().min(1000).max(1000000);
+        const result = amountSchema.safeParse(req.body?.amount);
 
         if (!result.success) {
             return res.status(400).json({
@@ -36,16 +50,12 @@ router.post("/add-money/order", authMiddleware, async (req, res) => {
             });
         }
 
-        const amount = result.data;
-
-        // Create an order with Razorpay
         const razorpayOrder = await razorpay.orders.create({
-            amount,
+            amount: result.data,
             currency: "INR",
             receipt: `kp_${Date.now()}`
         });
 
-        // Save the order for the authenticated user
         await PaymentOrder.create({
             userId: req.userId,
             gatewayOrderId: razorpayOrder.id,
@@ -54,14 +64,12 @@ router.post("/add-money/order", authMiddleware, async (req, res) => {
             status: "CREATED"
         });
 
-        // Return only the public Key ID, never the Key Secret
         return res.status(201).json({
             orderId: razorpayOrder.id,
             amount: razorpayOrder.amount,
             currency: razorpayOrder.currency,
             keyId: process.env.RAZORPAY_KEY_ID
         });
-
     } catch (error) {
         console.error("Create Razorpay order error:", error.message);
 
@@ -71,12 +79,17 @@ router.post("/add-money/order", authMiddleware, async (req, res) => {
     }
 });
 
+// --------------------------------------------------
+// ADD MONEY: VERIFY PAYMENT
+// --------------------------------------------------
 
 router.post("/add-money/verify", authMiddleware, async (req, res) => {
-    const { razorpay_order_id, razorpay_payment_id, razorpay_signature } =
-        req.body || {};
+    const {
+        razorpay_order_id,
+        razorpay_payment_id,
+        razorpay_signature
+    } = req.body || {};
 
-    // Validate the callback fields.
     if (
         typeof razorpay_order_id !== "string" ||
         typeof razorpay_payment_id !== "string" ||
@@ -93,7 +106,6 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
     let session;
 
     try {
-        // Find an order belonging to the signed-in user.
         const paymentOrder = await PaymentOrder.findOne({
             gatewayOrderId: razorpay_order_id,
             userId: req.userId
@@ -105,7 +117,6 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
             });
         }
 
-        // Verify Razorpay's HMAC SHA-256 signature.
         const expectedSignature = crypto
             .createHmac("sha256", process.env.RAZORPAY_KEY_SECRET)
             .update(`${razorpay_order_id}|${razorpay_payment_id}`)
@@ -114,14 +125,15 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
         const expectedBuffer = Buffer.from(expectedSignature, "hex");
         const receivedBuffer = Buffer.from(razorpay_signature, "hex");
 
-        if (!crypto.timingSafeEqual(expectedBuffer, receivedBuffer)) {
+        if (
+            expectedBuffer.length !== receivedBuffer.length ||
+            !crypto.timingSafeEqual(expectedBuffer, receivedBuffer)
+        ) {
             return res.status(400).json({
                 error: "Payment signature verification failed"
             });
         }
 
-        // Ask Razorpay for the payment details instead of trusting
-        // the browser's success callback alone.
         const payment = await razorpay.payments.fetch(
             razorpay_payment_id
         );
@@ -136,18 +148,15 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
             });
         }
 
-        // Only credit money after Razorpay confirms capture.
         if (payment.status !== "captured") {
             return res.status(409).json({
                 error: "Payment is not captured yet. Wallet was not credited."
             });
         }
 
-        // The payment must be processed atomically.
         session = await mongoose.startSession();
 
         let responseData;
-        let responseStatus = 200;
 
         await session.withTransaction(async () => {
             const currentOrder = await PaymentOrder.findOne({
@@ -156,16 +165,12 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
             }).session(session);
 
             if (!currentOrder) {
-                const error = new Error("Payment order not found");
-                error.status = 404;
-                throw error;
+                throw createHttpError(404, "Payment order not found");
             }
 
-            // An identical callback must never credit the wallet again.
             if (currentOrder.status === "PAID") {
                 if (
-                    currentOrder.gatewayPaymentId ===
-                    razorpay_payment_id
+                    currentOrder.gatewayPaymentId === razorpay_payment_id
                 ) {
                     responseData = {
                         message: "Payment already verified",
@@ -176,22 +181,19 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
                     return;
                 }
 
-                const error = new Error(
+                throw createHttpError(
+                    409,
                     "This order has already been paid"
                 );
-                error.status = 409;
-                throw error;
             }
 
             if (currentOrder.status !== "CREATED") {
-                const error = new Error(
+                throw createHttpError(
+                    409,
                     "This payment order cannot be processed"
                 );
-                error.status = 409;
-                throw error;
             }
 
-            // Claim the order inside the transaction.
             const claimedOrder = await PaymentOrder.findOneAndUpdate(
                 {
                     _id: currentOrder._id,
@@ -204,29 +206,32 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
                         paidVia: "CALLBACK"
                     }
                 },
-                { returnDocument: 'after', session }
+                {
+                    returnDocument: "after",
+                    session
+                }
             );
 
             if (!claimedOrder) {
-                const error = new Error(
+                throw createHttpError(
+                    409,
                     "Payment order is already being processed"
                 );
-                error.status = 409;
-                throw error;
             }
 
-            // Credit the authenticated user's wallet.
             const wallet = await Wallet.findOneAndUpdate(
                 { userId: req.userId },
                 { $inc: { balance: claimedOrder.amount } },
-                { returnDocument: 'after', session }
+                {
+                    returnDocument: "after",
+                    session
+                }
             );
 
             if (!wallet) {
                 throw new Error("Wallet not found");
             }
 
-            // Record the successful top-up.
             const [transaction] = await Transaction.create([{
                 type: "TOPUP",
                 fromUserId: null,
@@ -236,7 +241,6 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
                 status: "SUCCESS"
             }], { session });
 
-            // Record the wallet credit in the ledger.
             await LedgerEntry.create([{
                 userId: req.userId,
                 transactionId: transaction._id,
@@ -245,7 +249,6 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
                 balanceAfter: wallet.balance
             }], { session });
 
-            // Link the payment order to the transaction.
             await PaymentOrder.updateOne(
                 { _id: claimedOrder._id },
                 { $set: { transactionId: transaction._id } },
@@ -259,11 +262,9 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
                 currency: claimedOrder.currency,
                 walletBalance: wallet.balance
             };
-            responseStatus = 200;
         });
 
-        return res.status(responseStatus).json(responseData);
-
+        return res.status(200).json(responseData);
     } catch (error) {
         console.error("Payment verification error:", error.message);
 
@@ -283,17 +284,29 @@ router.post("/add-money/verify", authMiddleware, async (req, res) => {
     }
 });
 
+// --------------------------------------------------
+// TRANSFER VALIDATION
+// --------------------------------------------------
 
 const transferSchema = z.object({
     to: z.string().trim().toLowerCase().email(),
     amount: z.number().int().min(100).max(1000000),
-    note: z.string().trim().max(50).optional()
+    note: z.string().trim().max(50).optional(),
+    pin: z.string().regex(/^\d{4,6}$/, "Enter a valid payment PIN")
 });
+
+// --------------------------------------------------
+// TRANSFER MONEY WITH PAYMENT PIN AND DAILY LIMIT
+// --------------------------------------------------
 
 router.post("/transfer", authMiddleware, async (req, res) => {
     const key = req.get("Idempotency-Key");
 
-    if (!key || !key.trim() || key.length > 200) {
+    if (
+        typeof key !== "string" ||
+        !key.trim() ||
+        key.length > 200
+    ) {
         return res.status(400).json({
             error: "A valid Idempotency-Key header is required"
         });
@@ -303,39 +316,90 @@ router.post("/transfer", authMiddleware, async (req, res) => {
 
     if (!result.success) {
         const issue = result.error.issues[0];
+
         return res.status(400).json({
             error: `${issue.path[0] || "body"}: ${issue.message}`
+        });
+    }
+
+    let pinResult;
+
+    try {
+        pinResult = await verifyPaymentPin(
+            req.userId,
+            result.data.pin
+        );
+    } catch (error) {
+        console.error("Payment PIN verification error:", error.message);
+
+        return res.status(500).json({
+            error: "Payment PIN verification failed. Please try again."
+        });
+    }
+
+    if (!pinResult.ok) {
+        if (pinResult.status === "PIN_NOT_SET") {
+            return res.status(400).json({
+                error: "Set your payment PIN first"
+            });
+        }
+
+        if (pinResult.status === "PIN_LOCKED") {
+            return res.status(423).json({
+                error: "Payment PIN is temporarily locked",
+                retryAfterSeconds: pinResult.retryAfterSeconds
+            });
+        }
+
+        if (pinResult.status === "PIN_RETRY") {
+            return res.status(409).json({
+                error: "PIN verification conflicted with another request. Try again."
+            });
+        }
+
+        return res.status(401).json({
+            error: "Incorrect payment PIN",
+            attemptsRemaining: pinResult.attemptsRemaining
         });
     }
 
     const { to, amount, note } = result.data;
     const cleanNote = note || "Wallet transfer";
 
+    // Do not include the PIN in the idempotency request hash.
     const requestHash = crypto
         .createHash("sha256")
-        .update(JSON.stringify({ to, amount, note: cleanNote }))
+        .update(JSON.stringify({
+            to,
+            amount,
+            note: cleanNote
+        }))
         .digest("hex");
 
     let record;
 
     try {
-        // Create a unique record before moving any money.
+        // Reserve the idempotency key before any money movement.
         try {
             [record] = await IdempotencyRecord.create([{
                 userId: req.userId,
-                key,
+                key: key.trim(),
                 requestHash,
                 status: "IN_PROGRESS"
             }]);
         } catch (error) {
-            if (error.code !== 11000) throw error;
+            if (error.code !== 11000) {
+                throw error;
+            }
 
             const existing = await IdempotencyRecord.findOne({
                 userId: req.userId,
-                key
+                key: key.trim()
             });
 
-            if (!existing) throw error;
+            if (!existing) {
+                throw error;
+            }
 
             if (existing.requestHash !== requestHash) {
                 return res.status(422).json({
@@ -343,7 +407,7 @@ router.post("/transfer", authMiddleware, async (req, res) => {
                 });
             }
 
-            if (existing.status === "DONE") {
+            if (existing.status === "DONE" && existing.response) {
                 return res
                     .status(existing.response.httpStatus)
                     .json(existing.response.body);
@@ -357,23 +421,20 @@ router.post("/transfer", authMiddleware, async (req, res) => {
         const sender = await User.findById(req.userId);
 
         if (!sender) {
-            const error = new Error("Sender not found");
-            error.status = 404;
-            throw error;
+            throw createHttpError(404, "Sender not found");
         }
 
         const receiver = await User.findOne({ username: to });
 
         if (!receiver) {
-            const error = new Error("Recipient user not found");
-            error.status = 404;
-            throw error;
+            throw createHttpError(404, "Recipient user not found");
         }
 
         if (sender._id.equals(receiver._id)) {
-            const error = new Error("You cannot transfer money to yourself");
-            error.status = 400;
-            throw error;
+            throw createHttpError(
+                400,
+                "You cannot transfer money to yourself"
+            );
         }
 
         const session = await mongoose.startSession();
@@ -381,31 +442,96 @@ router.post("/transfer", authMiddleware, async (req, res) => {
 
         try {
             await session.withTransaction(async () => {
+                const dayKey = getIndiaDayKey();
+
+                // Ensure a daily counter exists for this sender.
+                // The unique { userId, dayKey } index prevents duplicate
+                // counter documents for the same sender and date.
+                await DailyTransferLimit.updateOne(
+                    {
+                        userId: sender._id,
+                        dayKey
+                    },
+                    {
+                        $setOnInsert: {
+                            userId: sender._id,
+                            dayKey,
+                            totalAmount: 0
+                        }
+                    },
+                    {
+                        upsert: true,
+                        session
+                    }
+                );
+
+                // Atomically reserve the amount only when it will not
+                // push the daily total over ₹10,000.
+                const dailyLimitRecord =
+                    await DailyTransferLimit.findOneAndUpdate(
+                        {
+                            userId: sender._id,
+                            dayKey,
+                            totalAmount: {
+                                $lte: DAILY_TRANSFER_LIMIT - amount
+                            }
+                        },
+                        {
+                            $inc: {
+                                totalAmount: amount
+                            }
+                        },
+                        {
+                            returnDocument: "after",
+                            session
+                        }
+                    );
+
+                if (!dailyLimitRecord) {
+                    throw createHttpError(
+                        429,
+                        "Daily transfer limit of ₹10,000 exceeded"
+                    );
+                }
+
+                // Debit the sender only if their balance is sufficient.
                 const senderWallet = await Wallet.findOneAndUpdate(
                     {
                         userId: sender._id,
                         balance: { $gte: amount }
                     },
-                    { $inc: { balance: -amount } },
-                    { returnDocument: 'after', session }
+                    {
+                        $inc: { balance: -amount }
+                    },
+                    {
+                        returnDocument: "after",
+                        session
+                    }
                 );
 
                 if (!senderWallet) {
-                    const error = new Error("Insufficient balance");
-                    error.status = 400;
-                    throw error;
+                    throw createHttpError(
+                        400,
+                        "Insufficient balance"
+                    );
                 }
 
                 const receiverWallet = await Wallet.findOneAndUpdate(
                     { userId: receiver._id },
-                    { $inc: { balance: amount } },
-                    { returnDocument: 'after', session }
+                    {
+                        $inc: { balance: amount }
+                    },
+                    {
+                        returnDocument: "after",
+                        session
+                    }
                 );
 
                 if (!receiverWallet) {
-                    const error = new Error("Recipient wallet not found");
-                    error.status = 404;
-                    throw error;
+                    throw createHttpError(
+                        404,
+                        "Recipient wallet not found"
+                    );
                 }
 
                 const [transaction] = await Transaction.create([{
@@ -444,6 +570,7 @@ router.post("/transfer", authMiddleware, async (req, res) => {
                     note: cleanNote
                 };
 
+                // Save the success response in the same transaction.
                 const updated = await IdempotencyRecord.updateOne(
                     {
                         _id: record._id,
@@ -462,7 +589,9 @@ router.post("/transfer", authMiddleware, async (req, res) => {
                 );
 
                 if (updated.modifiedCount !== 1) {
-                    throw new Error("Could not save idempotency response");
+                    throw new Error(
+                        "Could not save idempotency response"
+                    );
                 }
             });
         } finally {
@@ -473,12 +602,20 @@ router.post("/transfer", authMiddleware, async (req, res) => {
     } catch (error) {
         console.error("Transfer error:", error.message);
 
-        if (record && [400, 404].includes(error.status)) {
+        // Save expected business errors so the same idempotency key
+        // receives the same response on retry.
+        if (
+            record &&
+            [400, 404, 429].includes(error.status)
+        ) {
             const body = { error: error.message };
 
             try {
                 await IdempotencyRecord.updateOne(
-                    { _id: record._id, status: "IN_PROGRESS" },
+                    {
+                        _id: record._id,
+                        status: "IN_PROGRESS"
+                    },
                     {
                         $set: {
                             status: "DONE",
@@ -492,10 +629,15 @@ router.post("/transfer", authMiddleware, async (req, res) => {
 
                 return res.status(error.status).json(body);
             } catch (saveError) {
-                console.error("Could not save error response:", saveError.message);
+                console.error(
+                    "Could not save error response:",
+                    saveError.message
+                );
             }
         }
 
+        // If this was a transient or unexpected error, release the
+        // idempotency key so the request can be retried.
         if (record) {
             try {
                 await IdempotencyRecord.deleteOne({
@@ -503,14 +645,22 @@ router.post("/transfer", authMiddleware, async (req, res) => {
                     status: "IN_PROGRESS"
                 });
             } catch (cleanupError) {
-                console.error("Cleanup error:", cleanupError.message);
+                console.error(
+                    "Cleanup error:",
+                    cleanupError.message
+                );
             }
         }
 
-        return res.status(500).json({ error: "Transfer failed" });
+        return res.status(500).json({
+            error: "Transfer failed"
+        });
     }
 });
 
+// --------------------------------------------------
+// TRANSACTION HISTORY
+// --------------------------------------------------
 
 router.get("/transactions", authMiddleware, async (req, res) => {
     try {
@@ -545,54 +695,55 @@ router.get("/transactions", authMiddleware, async (req, res) => {
             .skip((page - 1) * limit)
             .limit(limit);
 
-        
-const formattedTransactions = transactions.map(transaction => {
-    const item = transaction.toObject();
+        const formattedTransactions = transactions.map(transaction => {
+            const item = transaction.toObject();
 
-    switch (item.type) {
-        case "WITHDRAWAL":
-            item.withWhom = "Withdrawal to bank";
-            break;
+            switch (item.type) {
+                case "WITHDRAWAL":
+                    item.withWhom = "Withdrawal to bank";
+                    break;
 
-        case "REVERSAL":
-            item.withWhom = "Refund of failed withdrawal";
-            break;
+                case "REVERSAL":
+                    item.withWhom = "Refund of failed withdrawal";
+                    break;
 
-        case "TOPUP":
-        case "DEPOSIT":
-            item.withWhom = "Money added to wallet";
-            break;
+                case "TOPUP":
+                case "DEPOSIT":
+                    item.withWhom = "Money added to wallet";
+                    break;
 
-        case "TRANSFER":
-            if (item.fromUserId?._id?.toString() === req.userId.toString()) {
-                item.withWhom = item.toUserId
-                    ? `Transfer to ${item.toUserId.username}`
-                    : "Wallet transfer";
-            } else {
-                item.withWhom = item.fromUserId
-                    ? `Transfer from ${item.fromUserId.username}`
-                    : "Wallet transfer";
+                case "TRANSFER":
+                    if (
+                        item.fromUserId?._id?.toString() ===
+                        req.userId.toString()
+                    ) {
+                        item.withWhom = item.toUserId
+                            ? `Transfer to ${item.toUserId.username}`
+                            : "Wallet transfer";
+                    } else {
+                        item.withWhom = item.fromUserId
+                            ? `Transfer from ${item.fromUserId.username}`
+                            : "Wallet transfer";
+                    }
+                    break;
+
+                default:
+                    item.withWhom = item.note || item.type;
             }
-            break;
 
-        default:
-            item.withWhom = item.note || item.type;
-    }
+            return item;
+        });
 
-    return item;
-});
-
-return res.status(200).json({
-    message: "Transaction history retrieved successfully",
-    pagination: {
-        page,
-        limit,
-        total,
-        totalPages: Math.ceil(total / limit)
-    },
-    transactions: formattedTransactions
-});
-
+        return res.status(200).json({
+            message: "Transaction history retrieved successfully",
+            pagination: {
+                page,
+                limit,
+                total,
+                totalPages: Math.ceil(total / limit)
+            },
+            transactions: formattedTransactions
+        });
     } catch (error) {
         console.error("Transaction history error:", error.message);
 
@@ -601,6 +752,10 @@ return res.status(200).json({
         });
     }
 });
+
+// --------------------------------------------------
+// WALLET BALANCE
+// --------------------------------------------------
 
 router.get("/balance", authMiddleware, async (req, res) => {
     try {
@@ -629,13 +784,14 @@ router.get("/balance", authMiddleware, async (req, res) => {
     }
 });
 
+// --------------------------------------------------
+// RAZORPAY ORDER STATUS
+// --------------------------------------------------
 
 router.get("/add-money/orders/:orderId", authMiddleware, async (req, res) => {
     try {
-        const { orderId } = req.params;
-
         const order = await PaymentOrder.findOne({
-            _id: orderId,
+            _id: req.params.orderId,
             userId: req.userId
         }).select(
             "gatewayOrderId amount currency status gatewayPaymentId paidVia transactionId createdAt updatedAt"
@@ -676,10 +832,16 @@ router.get("/add-money/orders/:orderId", authMiddleware, async (req, res) => {
     }
 });
 
+// --------------------------------------------------
+// BANK ACCOUNTS
+// --------------------------------------------------
 
 const bankAccountSchema = z.object({
     holderName: z.string().trim().min(2).max(60),
-    accountNumber: z.string().regex(/^\d{9,18}$/, "Account number must contain 9–18 digits"),
+    accountNumber: z.string().regex(
+        /^\d{9,18}$/,
+        "Account number must contain 9–18 digits"
+    ),
     ifsc: z.string().trim().toUpperCase().regex(
         /^[A-Z]{4}0[A-Z0-9]{6}$/,
         "Invalid IFSC code"
@@ -690,7 +852,6 @@ function maskAccountNumber(last4) {
     return `XXXXXX${last4}`;
 }
 
-// Register a bank account
 router.post("/bank-accounts", authMiddleware, async (req, res) => {
     const result = bankAccountSchema.safeParse(req.body || {});
 
@@ -740,13 +901,13 @@ router.post("/bank-accounts", authMiddleware, async (req, res) => {
         }
 
         console.error("Register bank account error:", error.message);
+
         return res.status(500).json({
             error: "Failed to register bank account"
         });
     }
 });
 
-// List the authenticated user's saved bank accounts
 router.get("/bank-accounts", authMiddleware, async (req, res) => {
     try {
         const accounts = await BankAccount.find({
@@ -767,12 +928,16 @@ router.get("/bank-accounts", authMiddleware, async (req, res) => {
         });
     } catch (error) {
         console.error("List bank accounts error:", error.message);
+
         return res.status(500).json({
             error: "Failed to retrieve bank accounts"
         });
     }
 });
 
+// --------------------------------------------------
+// WALLET RECONCILIATION
+// --------------------------------------------------
 
 router.get("/reconciliation", authMiddleware, async (req, res) => {
     try {
@@ -824,6 +989,5 @@ router.get("/reconciliation", authMiddleware, async (req, res) => {
         });
     }
 });
-
 
 module.exports = router;

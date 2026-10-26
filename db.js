@@ -9,6 +9,9 @@ async function connectDB() {
         await IdempotencyRecord.init();
         console.log("Idempotency index initialized");
 
+        await DailyTransferLimit.init();
+        console.log("Daily transfer limit index initialized");
+
     } catch (error) {
         console.error("MongoDB connection failed:", error.message);
         process.exit(1);
@@ -36,9 +39,23 @@ const userSchema = new mongoose.Schema({
         trim: true,
         maxlength: 50
     },
-    passwordHash: {
+        passwordHash: {
         type: String,
         required: true
+    },
+    paymentPinHash: {
+        type: String,
+        default: null,
+        select: false
+    },
+    pinFailedAttempts: {
+        type: Number,
+        default: 0,
+        min: 0
+    },
+    pinLockedUntil: {
+        type: Date,
+        default: null
     }
 });
 
@@ -232,7 +249,36 @@ idempotencyRecordSchema.index(
     { unique: true }
 );
 
+// Daily outgoing transfer limit — amounts are stored in paise.
+const dailyTransferLimitSchema = new mongoose.Schema({
+    userId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    dayKey: {
+        type: String,
+        required: true
+    },
+    totalAmount: {
+        type: Number,
+        required: true,
+        default: 0,
+        min: 0
+    }
+}, {
+    timestamps: true
+});
 
+dailyTransferLimitSchema.index(
+    { userId: 1, dayKey: 1 },
+    { unique: true }
+);
+
+const DailyTransferLimit = mongoose.model(
+    "DailyTransferLimit",
+    dailyTransferLimitSchema
+);
 const User = mongoose.model("User", userSchema);
 const Wallet = mongoose.model("Wallet", walletSchema);
 const PaymentOrder = mongoose.model("PaymentOrder", paymentOrderSchema);
@@ -379,6 +425,7 @@ const OutboxEvent = mongoose.model("OutboxEvent", outboxEventSchema);
 module.exports = {
     connectDB,
     User,
+    DailyTransferLimit,
     Wallet,
     PaymentOrder,
     Transaction,
