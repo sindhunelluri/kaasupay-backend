@@ -1,0 +1,343 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>KaasuPay - Add Money</title>
+
+    <!-- Razorpay Checkout -->
+    <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f2f5fa;
+            color: #222;
+        }
+
+        .card {
+            width: 100%;
+            max-width: 420px;
+            padding: 30px;
+            background: #ffffff;
+            border-radius: 14px;
+            box-shadow: 0 5px 25px rgba(0, 0, 0, 0.08);
+        }
+
+        h2 {
+            margin-top: 0;
+            margin-bottom: 10px;
+            text-align: center;
+            color: #1769ff;
+        }
+
+        .description {
+            margin-bottom: 25px;
+            color: #666;
+            font-size: 14px;
+            line-height: 1.5;
+            text-align: center;
+        }
+
+        label {
+            display: block;
+            margin-top: 16px;
+            margin-bottom: 7px;
+            font-size: 14px;
+            font-weight: bold;
+        }
+
+        input {
+            display: block;
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ccc;
+            border-radius: 7px;
+            font-size: 14px;
+            background: #fff;
+        }
+
+        input:focus {
+            outline: none;
+            border-color: #1769ff;
+            box-shadow: 0 0 0 2px rgba(23, 105, 255, 0.12);
+        }
+
+        button {
+            width: 100%;
+            margin-top: 24px;
+            padding: 13px;
+            border: none;
+            border-radius: 7px;
+            background: #1769ff;
+            color: white;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
+
+        button:hover:not(:disabled) {
+            background: #0e50cc;
+        }
+
+        button:disabled {
+            background: #9bb9f5;
+            cursor: not-allowed;
+        }
+
+        #message {
+            margin-top: 18px;
+            font-size: 14px;
+            line-height: 1.6;
+            overflow-wrap: anywhere;
+        }
+
+        .note {
+            margin-top: 20px;
+            color: #777;
+            font-size: 12px;
+            line-height: 1.5;
+            text-align: center;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="card">
+        <h2>KaasuPay</h2>
+
+        <p class="description">
+            Add money to your wallet securely using Razorpay Test Mode.
+        </p>
+
+        <form id="paymentForm">
+            <label for="token">JWT Access Token</label>
+
+            <input
+                id="token"
+                type="password"
+                placeholder="Paste your sign-in token"
+                autocomplete="off"
+                required
+            >
+
+            <label for="amount">Amount (₹)</label>
+
+            <input
+                id="amount"
+                type="number"
+                min="10"
+                max="10000"
+                step="1"
+                placeholder="Enter amount"
+                required
+            >
+
+            <button id="payButton" type="submit">
+                Pay with Razorpay
+            </button>
+        </form>
+
+        <p id="message" role="status" aria-live="polite"></p>
+
+        <p class="note">
+            Test mode only. Use Razorpay's test payment details.
+            Never enter real card or banking details here.
+        </p>
+    </div>
+
+    <script>
+        const form = document.getElementById("paymentForm");
+        const tokenInput = document.getElementById("token");
+        const amountInput = document.getElementById("amount");
+        const payButton = document.getElementById("payButton");
+        const message = document.getElementById("message");
+
+        form.addEventListener("submit", async function (event) {
+            event.preventDefault();
+
+            if (!window.Razorpay) {
+                message.textContent =
+                    "Razorpay Checkout could not load. Check your internet connection and refresh the page.";
+                return;
+            }
+
+            const token = tokenInput.value.trim();
+            const rupees = Number(amountInput.value);
+
+            if (!token) {
+                message.textContent = "Please enter your JWT access token.";
+                return;
+            }
+
+            if (
+                !Number.isInteger(rupees) ||
+                rupees < 10 ||
+                rupees > 10000
+            ) {
+                message.textContent =
+                    "Enter an amount between ₹10 and ₹10,000 in whole rupees.";
+                return;
+            }
+
+            payButton.disabled = true;
+            message.textContent = "Creating your payment order...";
+
+            let checkoutOpened = false;
+
+            try {
+                // STEP 1: Create an order on the KaasuPay backend.
+                const orderResponse = await fetch(
+                    "/api/v1/wallet/add-money/order",
+                    {
+                        method: "POST",
+                        headers: {
+                            "Content-Type": "application/json",
+                            "Authorization": `Bearer ${token}`
+                        },
+                        body: JSON.stringify({
+                            amount: rupees * 100
+                        })
+                    }
+                );
+
+                const order = await orderResponse.json();
+
+                if (!orderResponse.ok) {
+                    throw new Error(
+                        order.error || "Could not create payment order."
+                    );
+                }
+
+                message.textContent = "Opening Razorpay Checkout...";
+
+                // STEP 2: Configure Razorpay Checkout.
+                const options = {
+                    key: order.keyId,
+                    amount: order.amount,
+                    currency: order.currency,
+                    name: "KaasuPay",
+                    description: "Wallet top-up",
+                    order_id: order.orderId,
+
+                    // STEP 3: Verify the payment on the backend.
+                    handler: async function (payment) {
+                        message.textContent =
+                            "Payment response received. Verifying with the server...";
+
+                        try {
+                            const verifyResponse = await fetch(
+                                "/api/v1/wallet/add-money/verify",
+                                {
+                                    method: "POST",
+                                    headers: {
+                                        "Content-Type": "application/json",
+                                        "Authorization": `Bearer ${token}`
+                                    },
+                                    body: JSON.stringify({
+                                        razorpay_order_id:
+                                            payment.razorpay_order_id,
+                                        razorpay_payment_id:
+                                            payment.razorpay_payment_id,
+                                        razorpay_signature:
+                                            payment.razorpay_signature
+                                    })
+                                }
+                            );
+
+                            const verification =
+                                await verifyResponse.json();
+
+                            if (!verifyResponse.ok) {
+                                throw new Error(
+                                    verification.error ||
+                                    "Payment verification failed."
+                                );
+                            }
+
+                            let successMessage =
+                                verification.message ||
+                                "Payment verified successfully.";
+
+                            if (
+                                Number.isInteger(
+                                    verification.walletBalance
+                                )
+                            ) {
+                                successMessage +=
+                                    " Wallet balance: ₹" +
+                                    (
+                                        verification.walletBalance / 100
+                                    ).toFixed(2);
+                            } else {
+                                successMessage +=
+                                    " Check your wallet balance to confirm the final amount.";
+                            }
+
+                            message.textContent = successMessage;
+
+                        } catch (error) {
+                            message.textContent =
+                                error.message +
+                                " Do not pay again immediately. Check the payment and wallet status first.";
+                        } finally {
+                            payButton.disabled = false;
+                        }
+                    },
+
+                    modal: {
+                        ondismiss: function () {
+                            message.textContent =
+                                "Checkout closed. If you attempted payment, check its status before retrying.";
+
+                            payButton.disabled = false;
+                        }
+                    },
+
+                    theme: {
+                        color: "#1769ff"
+                    }
+                };
+
+                const checkout = new Razorpay(options);
+
+                checkout.on("payment.failed", function (event) {
+                    const description =
+                        event.error && event.error.description
+                            ? event.error.description
+                            : "Please check the payment status.";
+
+                    message.textContent = "Payment failed: " + description;
+                    payButton.disabled = false;
+                });
+
+                checkout.open();
+                checkoutOpened = true;
+
+                message.textContent =
+                    "Checkout opened. Complete your test payment to continue.";
+
+            } catch (error) {
+                message.textContent = error.message;
+            } finally {
+                // Keep the button disabled while Checkout is open.
+                if (!checkoutOpened) {
+                    payButton.disabled = false;
+                }
+            }
+        });
+    </script>
+</body>
+</html>
