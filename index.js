@@ -4,11 +4,21 @@ require("dotenv").config();
 //Starts server
 const express = require("express"); //We are importing Express.
 const rootRouter = require("./routes/index");//import all api routes from the index.js file in the routes folder. This is where we define all our API endpoints.
-
+const cors = require("cors");
 const { connectDB } = require("./db"); //This reads your .env file & This imports the MongoDB connection function from your db.js.
 
 const app = express(); //This creates our Express application.
 // Keep the original body for Razorpay webhook signature verification
+
+app.use(cors({
+    origin: [
+        "http://localhost:5173",
+        "https://kaasupay-frontend.onrender.com"
+    ],
+    methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+}));
+
 app.use(
     "/api/v1/webhooks/razorpay",
     express.raw({ type: "application/json" })
