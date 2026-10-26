@@ -27,15 +27,17 @@ app.use(express.static("public"));
 app.use("/api/v1", rootRouter);
 
 // Connect to MongoDB, then start server
-connectDB().then(() => {
-    app.listen(3000, () => {
-        console.log("Server running on http://localhost:3000");
-    });
-});
+connectDB()
+    .then(() => {
+        const PORT = process.env.PORT || 3000;
 
-// Start server
-/* app.listen(3000, () => { //Start listening for requests on port 3000.
-    console.log("Server running on http://localhost:3000");
-}); */
-//to run the server, use the command: node index.js 
+        app.listen(PORT, "0.0.0.0", () => {
+            console.log(`KaasuPay backend running on port ${PORT}`);
+        });
+    })
+    .catch((error) => {
+        console.error("Failed to connect to MongoDB:", error);
+        process.exit(1);
+    });
+
 
