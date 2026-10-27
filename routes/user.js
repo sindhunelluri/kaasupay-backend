@@ -129,64 +129,73 @@ const signinSchema = z.object({
 
 
 // SIGNIN
+
+ // SIGNIN
 router.post("/signin", async (req, res) => {
+    const requestStart = Date.now();
 
-    // 1. Validate request data
-    const result = signinSchema.safeParse(req.body);
+    try {
+        const result = signinSchema.safeParse(req.body);
 
-    if (!result.success) {
-        return res.status(400).json({
-            error: firstError(result.error)
-        });
-    }
-
-    const {
-        username,
-        password
-    } = result.data;
-
-
-    // 2. Find user by email
-    const user = await User.findOne({ username });
-
-    if (!user) {
-        return res.status(401).json({
-            error: "Wrong email or password"
-        });
-    }
-
-
-    // 3. Compare entered password with stored hash
-    const passwordOk = await bcrypt.compare(
-        password,
-        user.passwordHash
-    );
-
-    if (!passwordOk) {
-        return res.status(401).json({
-            error: "Wrong email or password"
-        });
-    }
-
-
-    // 4. Create JWT token
-    const token = jwt.sign(
-        {
-            userId: user._id.toString()
-        },
-        JWT_SECRET,
-        {
-            expiresIn: "1h"
+        if (!result.success) {
+            return res.status(400).json({
+                error: firstError(result.error)
+            });
         }
-    );
 
+        const { username, password } = result.data;
 
-    // 5. Send token
-    return res.json({
-        message: "Signed in",
-        token
-    });
+        const dbStart = Date.now();
+        const user = await User.findOne({ username });
+        const dbMs = Date.now() - dbStart;
+
+        if (!user) {
+            console.log(`[SIGNIN TIMING] db=${dbMs}ms user-not-found`);
+            return res.status(401).json({
+                error: "Wrong email or password"
+            });
+        }
+
+        const bcryptStart = Date.now();
+        const passwordOk = await bcrypt.compare(
+            password,
+            user.passwordHash
+        );
+        const bcryptMs = Date.now() - bcryptStart;
+
+        if (!passwordOk) {
+            console.log(
+                `[SIGNIN TIMING] db=${dbMs}ms bcrypt=${bcryptMs}ms password-invalid`
+            );
+            return res.status(401).json({
+                error: "Wrong email or password"
+            });
+        }
+
+        const jwtStart = Date.now();
+        const token = jwt.sign(
+            { userId: user._id.toString() },
+            JWT_SECRET,
+            { expiresIn: "1h" }
+        );
+        const jwtMs = Date.now() - jwtStart;
+
+        console.log(
+            `[SIGNIN TIMING] db=${dbMs}ms bcrypt=${bcryptMs}ms jwt=${jwtMs}ms total=${Date.now() - requestStart}ms`
+        );
+
+        return res.json({
+            message: "Signed in",
+            token
+        });
+    } catch (error) {
+        console.error("Sign-in error:", error);
+        return res.status(500).json({
+            error: "Something went wrong"
+        });
+    }
 });
+
 
 // GET CURRENT USER
 router.get("/me", authMiddleware, async (req, res) => {
