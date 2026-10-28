@@ -6,6 +6,9 @@ async function connectDB() {
         await mongoose.connect(process.env.MONGO_URL);
         console.log("MongoDB connected successfully");
 
+        console.log("Connected database:", mongoose.connection.name);
+        console.log("MongoDB host:", mongoose.connection.host);
+
         await IdempotencyRecord.init();
         console.log("Idempotency index initialized");
 
