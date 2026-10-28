@@ -15,15 +15,23 @@ const {
 } = require("../db");
 
 const authMiddleware = require("../middleware/auth");
+const { verifyPaymentPin } = require("../services/paymentPin");
 const router = express.Router();
+const WITHDRAWALS_PAUSED = true;
 
 const withdrawSchema = z.object({
     bankAccountId: z.string().regex(/^[a-f\d]{24}$/i),
-    amount: z.number().int().min(10000).max(2500000)
+    amount: z.number().int().min(10000).max(2500000),
+    pin: z.string().regex(/^\d{4,6}$/)
 });
 
 // POST /api/v1/wallet/withdraw
 router.post("/", authMiddleware, async (req, res) => {
+    if (WITHDRAWALS_PAUSED) {
+        return res.status(503).json({
+            error: "Withdrawals are temporarily paused. Please try again later."
+        });
+}
     const key = req.get("Idempotency-Key");
 
     if (!key || !key.trim() || key.length > 200) {
@@ -40,14 +48,54 @@ router.post("/", authMiddleware, async (req, res) => {
         });
     }
 
-    const { bankAccountId, amount } = result.data;
+    const { bankAccountId, amount, pin } = result.data;
 
-    const requestHash = crypto
-        .createHash("sha256")
-        .update(JSON.stringify({ bankAccountId, amount }))
-        .digest("hex");
+// Verify the payment PIN before processing the withdrawal.
 
-    let record;
+let pinResult;
+
+try {
+    pinResult = await verifyPaymentPin(req.userId, pin);
+} catch (error) {
+    console.error("Withdrawal PIN verification error:", error.message);
+
+    return res.status(500).json({
+        error: "Could not verify payment PIN"
+    });
+}
+
+if (!pinResult.ok) {
+    if (pinResult.status === "PIN_NOT_SET") {
+        return res.status(400).json({
+            error: "Set your payment PIN first"
+        });
+    }
+
+    if (pinResult.status === "PIN_LOCKED") {
+        return res.status(423).json({
+            error: "Payment PIN is temporarily locked",
+            retryAfterSeconds: pinResult.retryAfterSeconds
+        });
+    }
+
+    if (pinResult.status === "PIN_RETRY") {
+        return res.status(409).json({
+            error: "PIN verification conflicted with another request. Try again."
+        });
+    }
+
+    return res.status(401).json({
+        error: "Incorrect payment PIN",
+        attemptsRemaining: pinResult.attemptsRemaining
+    });
+}
+
+const requestHash = crypto
+    .createHash("sha256")
+    .update(JSON.stringify({ bankAccountId, amount }))
+    .digest("hex");
+
+let record;
 
     try {
         try {
