@@ -1,0 +1,285 @@
+
+require("dotenv").config();
+
+const mongoose = require("mongoose");
+const {
+    connectDB,
+    BankAccount,
+    Withdrawal,
+    OutboxEvent
+} = require("./db");
+
+const { reverseWithdrawal } = require("./services/money");
+
+const BANK_URL = process.env.BANK_URL || "http://localhost:4000";
+const POLL_INTERVAL_MS = 1000;
+const { MAX_ATTEMPTS, shouldMoveToReview, retryDelayMs } = require("./withdrawalRetryPolicy");
+const LOCK_TIMEOUT_MS = 60_000;
+
+let stopping = false;
+
+
+
+async function finishForReview(job, withdrawal, reason) {
+    console.error(
+    `[REVIEW] reference=${withdrawal.reference}, attempts=${job.attempts}, reason=${reason}`,
+    new Error("Review caller trace").stack
+    );
+    job.status = "STUCK";
+    job.lockedAt = null;
+    job.lastError = reason;
+    await job.save();
+
+    if (withdrawal.status !== "SUCCESS" &&
+        withdrawal.status !== "REVERSED") {
+        withdrawal.status = "NEEDS_REVIEW";
+        withdrawal.failureReason = reason;
+        await withdrawal.save();
+    }
+
+    console.error(
+        `Withdrawal ${withdrawal._id} needs review: ${reason}`
+    );
+}
+
+async function scheduleRetry(job, withdrawal, reason) {
+    if (shouldMoveToReview(job.attempts)) {
+        await finishForReview(job, withdrawal,
+            `Maximum attempts reached: ${reason}`);
+        return;
+    }
+
+    job.status = "NEW";
+    job.lockedAt = null;
+    job.lastError = reason;
+    job.nextAttemptAt = new Date(Date.now() + retryDelayMs(job.attempts));
+    await job.save();
+
+    // Keep it PROCESSING until another attempt, unless it was already
+    // explicitly placed in review. A timeout is not proof of failure.
+    console.log(
+        `Retry ${job.attempts + 1}/${MAX_ATTEMPTS} for ${withdrawal.reference}`
+    );
+}
+
+async function processNextWithdrawal() {
+    const now = new Date();
+
+    
+    // Recover jobs whose worker crashed while holding a lock.
+    const staleJob = await OutboxEvent.findOne({
+        type: "PAYOUT_REQUESTED",
+        status: "PROCESSING",
+        lockedAt: { $lte: new Date(Date.now() - LOCK_TIMEOUT_MS) }
+    }).sort({ lockedAt: 1 });
+
+    if (staleJob) {
+        const staleWithdrawal = await Withdrawal.findById(
+            staleJob.withdrawalId
+        );
+
+        if (!staleWithdrawal) {
+            staleJob.status = "STUCK";
+            staleJob.lockedAt = null;
+            staleJob.lastError = "Withdrawal record not found during stale-lock recovery";
+            await staleJob.save();
+            return true;
+        }
+
+        if (
+            staleWithdrawal.status === "SUCCESS" ||
+            staleWithdrawal.status === "REVERSED"
+        ) {
+            staleJob.status = "DONE";
+            staleJob.lockedAt = null;
+            await staleJob.save();
+            return true;
+        }
+
+        if (
+            staleWithdrawal.status === "NEEDS_REVIEW" ||
+            shouldMoveToReview(staleJob.attempts)
+        ) {
+            await finishForReview(
+                staleJob,
+                staleWithdrawal,
+                staleWithdrawal.failureReason ||
+                    "Maximum attempts reached; stale payout outcome is uncertain"
+            );
+            return true;
+        }
+
+        staleJob.status = "NEW";
+        staleJob.lockedAt = null;
+        staleJob.nextAttemptAt = now;
+        staleJob.lastError = "Recovered stale processing lock; payout outcome uncertain";
+        await staleJob.save();
+
+        // Recover the lock now. Do not submit a second payout in this call.
+        return true;
+    }
+
+
+    const job = await OutboxEvent.findOneAndUpdate(
+        {
+            type: "PAYOUT_REQUESTED",
+            status: "NEW",
+            nextAttemptAt: { $lte: new Date() }
+        },
+        {
+            $set: { status: "PROCESSING", lockedAt: new Date() },
+            $inc: { attempts: 1 }
+        },
+        {
+            sort: { nextAttemptAt: 1, createdAt: 1 },
+            returnDocument: "after"
+        }
+    );
+
+    if (!job) return Boolean(staleJob);
+    console.log(
+    `[CLAIMED] reference=${job.withdrawalId}, attempts=${job.attempts}, status=${job.status}`
+    );
+
+    const withdrawal = await Withdrawal.findById(job.withdrawalId);
+
+    if (!withdrawal) {
+        job.status = "STUCK";
+        job.lockedAt = null;
+        job.lastError = "Withdrawal record not found";
+        await job.save();
+        return true;
+    }
+
+    if (withdrawal.status === "SUCCESS" ||
+        withdrawal.status === "REVERSED") {
+        job.status = "DONE";
+        job.lockedAt = null;
+        await job.save();
+        return true;
+    }
+
+    if (withdrawal.status === "NEEDS_REVIEW") {
+        await finishForReview(job, withdrawal,
+            withdrawal.failureReason || "Already needs review");
+        return true;
+    }
+
+    const bankAccount = await BankAccount.findOne({
+        _id: withdrawal.bankAccountId,
+        userId: withdrawal.userId
+    });
+
+    if (!bankAccount) {
+        await finishForReview(job, withdrawal,
+            "Registered bank account not found");
+        return true;
+    }
+
+    try {
+        withdrawal.status = "PROCESSING";
+        await withdrawal.save();
+
+        const response = await fetch(`${BANK_URL}/payouts`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            signal: AbortSignal.timeout(3000),
+            body: JSON.stringify({
+                reference: withdrawal.reference,
+                accountNumber: bankAccount.accountNumber,
+                ifsc: bankAccount.ifsc,
+                amount: withdrawal.amount
+            })
+        });
+
+        let result;
+        try {
+            result = await response.json();
+        } catch {
+            throw new Error("Invalid response from bank; outcome uncertain");
+        }
+
+        if (response.ok &&
+            result.status === "SUCCESS" &&
+            typeof result.bankRef === "string" &&
+            result.bankRef) {
+            withdrawal.status = "SUCCESS";
+            withdrawal.bankRef = result.bankRef;
+            withdrawal.failureReason = null;
+            await withdrawal.save();
+
+            job.status = "DONE";
+            job.lockedAt = null;
+            job.lastError = null;
+            await job.save();
+
+            console.log(
+                `Withdrawal ${withdrawal._id} SUCCESS; bank reference ${result.bankRef}`
+            );
+            return true;
+        }
+
+        // Only an explicit, permanent refusal from the bank qualifies
+        // for reversal. Never refund on timeout, PROCESSING, or 5xx.
+        if (result.status === "FAILED" &&
+            result.permanent === true &&
+            response.status >= 400 &&
+            response.status < 500) {
+            await reverseWithdrawal(
+                withdrawal._id,
+                result.message || "Permanent bank refusal"
+            );
+
+            console.log(
+                `Withdrawal ${withdrawal._id} reversed after permanent refusal`
+            );
+            return true;
+        }
+
+        const reason = result.message ||
+            `Uncertain bank response: HTTP ${response.status}, status ${result.status}`;
+
+        await scheduleRetry(job, withdrawal, reason);
+    } catch (error) {
+        // Network errors and timeouts are uncertain: never refund here.
+        await scheduleRetry(job, withdrawal, error.message);
+    }
+
+    return true;
+}
+
+async function main() {
+    await connectDB();
+    console.log("KaasuPay withdrawal worker started");
+
+    while (!stopping) {
+        try {
+            const processed = await processNextWithdrawal();
+            if (!processed) {
+                await new Promise(resolve =>
+                    setTimeout(resolve, POLL_INTERVAL_MS)
+                );
+            }
+        } catch (error) {
+            console.error("Worker error:", error.message);
+            await new Promise(resolve =>
+                setTimeout(resolve, POLL_INTERVAL_MS)
+            );
+        }
+    }
+
+    await mongoose.disconnect();
+    console.log("Worker stopped");
+}
+
+process.on("SIGINT", () => { stopping = true; });
+process.on("SIGTERM", () => { stopping = true; });
+
+if (require.main === module) {
+    main().catch(error => {
+        console.error("Worker failed to start:", error.message);
+        process.exit(1);
+    });
+}
+
+module.exports = { processNextWithdrawal, main };

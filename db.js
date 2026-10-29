@@ -6,9 +6,6 @@ async function connectDB() {
         await mongoose.connect(process.env.MONGO_URL);
         console.log("MongoDB connected successfully");
 
-        console.log("Connected database:", mongoose.connection.name);
-        console.log("MongoDB host:", mongoose.connection.host);
-
         await IdempotencyRecord.init();
         console.log("Idempotency index initialized");
 
@@ -168,17 +165,11 @@ const transactionSchema = new mongoose.Schema({
         default: ""
     },
     status: {
-    type: String,
-    enum: [
-        "PENDING",
-        "PROCESSING",
-        "SUCCESS",
-        "REVERSED",
-        "NEEDS_REVIEW"
-    ],
-    default: "SUCCESS",
-    required: true
-}
+        type: String,
+        enum: ["PENDING", "PROCESSING", "SUCCESS", "REVERSED"],
+        default: "SUCCESS",
+        required: true
+    }
 }, {
     timestamps: true
 });
@@ -348,6 +339,11 @@ const withdrawalSchema = new mongoose.Schema({
         ref: "BankAccount",
         required: true
     },
+    transactionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Transaction",
+        default: null
+    },
     amount: {
         type: Number,
         required: true,
@@ -362,11 +358,6 @@ const withdrawalSchema = new mongoose.Schema({
         required: true,
         unique: true
     },
-    transactionId: {
-    type: mongoose.Schema.Types.ObjectId,
-    ref: "Transaction",
-    default: null
-},
     status: {
         type: String,
         enum: [

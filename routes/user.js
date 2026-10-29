@@ -199,27 +199,32 @@ router.post("/signin", async (req, res) => {
 
 // GET CURRENT USER
 router.get("/me", authMiddleware, async (req, res) => {
-    try {
-        const user = await User.findById(req.userId)
-            .select("-passwordHash");
+  try {
+    const user = await User.findById(req.userId)
+      .select("+paymentPinHash")
+      .lean();
 
-        if (!user) {
-            return res.status(404).json({
-                error: "User not found"
-            });
-        }
-
-        return res.json({
-            user
-        });
-
-    } catch (error) {
-        console.error("Get user error:", error);
-
-        return res.status(500).json({
-            error: "Something went wrong"
-        });
+    if (!user) {
+      return res.status(404).json({ error: "User not found" });
     }
+
+    console.log(
+      `[ME] user=${user.username} hasPaymentPin=${Boolean(user.paymentPinHash)}`
+    );
+
+    return res.status(200).json({
+      user: {
+        _id: user._id,
+        username: user.username,
+        firstName: user.firstName,
+        lastName: user.lastName,
+        hasPaymentPin: Boolean(user.paymentPinHash),
+      },
+    });
+  } catch (error) {
+    console.error("GET /me error:", error);
+    return res.status(500).json({ error: "Could not fetch user details." });
+  }
 });
 
 
