@@ -1,5 +1,5 @@
-
 const mongoose = require("mongoose");
+
 const {
     Wallet,
     Withdrawal,
@@ -9,10 +9,11 @@ const {
 } = require("../db");
 
 /**
- * Refund a withdrawal only after the bank has definitively
- * confirmed that the payout failed permanently.
+ * Reverse a withdrawal only after a permanent payout failure
+ * has been definitively confirmed by the bank.
  *
- * All wallet and ledger changes happen in one MongoDB transaction.
+ * The withdrawal, original transaction, wallet refund, ledger
+ * entry, and outbox update are handled atomically.
  */
 async function reverseWithdrawal(withdrawalId, reason) {
     const session = await mongoose.startSession();
@@ -21,12 +22,12 @@ async function reverseWithdrawal(withdrawalId, reason) {
         let result;
 
         await session.withTransaction(async () => {
-            // Claim the reversal once. Concurrent attempts cannot
-            // reverse the same withdrawal twice.
             const withdrawal = await Withdrawal.findOneAndUpdate(
                 {
                     _id: withdrawalId,
-                    status: { $in: ["PENDING", "PROCESSING"] }
+                    status: {
+                        $in: ["PENDING", "PROCESSING"]
+                    }
                 },
                 {
                     $set: {
@@ -49,7 +50,6 @@ async function reverseWithdrawal(withdrawalId, reason) {
                     throw new Error("Withdrawal not found");
                 }
 
-                // A previous successful reversal is safe to repeat.
                 if (current.status === "REVERSED") {
                     result = {
                         alreadyReversed: true,
@@ -63,9 +63,47 @@ async function reverseWithdrawal(withdrawalId, reason) {
                 );
             }
 
+            // Never issue a refund if the original transaction
+            // cannot be identified and updated.
+            if (!withdrawal.transactionId) {
+                throw new Error(
+                    "Withdrawal has no linked transaction; manual review required"
+                );
+            }
+
+            const transactionUpdate = await Transaction.updateOne(
+                {
+                    _id: withdrawal.transactionId,
+                    type: "WITHDRAWAL",
+                    status: {
+                        $in: ["PENDING", "PROCESSING"]
+                    }
+                },
+                {
+                    $set: {
+                        status: "REVERSED"
+                    }
+                },
+                {
+                    session
+                }
+            );
+
+            if (transactionUpdate.matchedCount !== 1) {
+                throw new Error(
+                    "Original withdrawal transaction is missing or not in a reversible state"
+                );
+            }
+
             const wallet = await Wallet.findOneAndUpdate(
-                { userId: withdrawal.userId },
-                { $inc: { balance: withdrawal.amount } },
+                {
+                    userId: withdrawal.userId
+                },
+                {
+                    $inc: {
+                        balance: withdrawal.amount
+                    }
+                },
                 {
                     returnDocument: "after",
                     session
@@ -76,34 +114,43 @@ async function reverseWithdrawal(withdrawalId, reason) {
                 throw new Error("Wallet not found during refund");
             }
 
-            const [transaction] = await Transaction.create(
-                [{
-                    type: "REVERSAL",
-                    fromUserId: null,
-                    toUserId: withdrawal.userId,
-                    amount: withdrawal.amount,
-                    note: "Refund of failed withdrawal",
-                    status: "SUCCESS"
-                }],
-                { session }
+            const [refundTransaction] = await Transaction.create(
+                [
+                    {
+                        type: "REVERSAL",
+                        fromUserId: null,
+                        toUserId: withdrawal.userId,
+                        amount: withdrawal.amount,
+                        note: "Refund of failed withdrawal",
+                        status: "SUCCESS"
+                    }
+                ],
+                {
+                    session
+                }
             );
 
             await LedgerEntry.create(
-                [{
-                    userId: withdrawal.userId,
-                    transactionId: transaction._id,
-                    direction: "CREDIT",
-                    amount: withdrawal.amount,
-                    balanceAfter: wallet.balance
-                }],
-                { session }
+                [
+                    {
+                        userId: withdrawal.userId,
+                        transactionId: refundTransaction._id,
+                        direction: "CREDIT",
+                        amount: withdrawal.amount,
+                        balanceAfter: wallet.balance
+                    }
+                ],
+                {
+                    session
+                }
             );
 
-            // Complete the associated job in the same transaction.
             await OutboxEvent.updateOne(
                 {
                     withdrawalId: withdrawal._id,
-                    status: { $in: ["NEW", "PROCESSING"] }
+                    status: {
+                        $in: ["NEW", "PROCESSING"]
+                    }
                 },
                 {
                     $set: {
@@ -112,7 +159,9 @@ async function reverseWithdrawal(withdrawalId, reason) {
                         lastError: reason
                     }
                 },
-                { session }
+                {
+                    session
+                }
             );
 
             result = {
@@ -129,4 +178,6 @@ async function reverseWithdrawal(withdrawalId, reason) {
     }
 }
 
-module.exports = { reverseWithdrawal };
+module.exports = {
+    reverseWithdrawal
+};

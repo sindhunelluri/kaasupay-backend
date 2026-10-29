@@ -168,11 +168,17 @@ const transactionSchema = new mongoose.Schema({
         default: ""
     },
     status: {
-        type: String,
-        enum: ["SUCCESS"],
-        default: "SUCCESS",
-        required: true
-    }
+    type: String,
+    enum: [
+        "PENDING",
+        "PROCESSING",
+        "SUCCESS",
+        "REVERSED",
+        "NEEDS_REVIEW"
+    ],
+    default: "SUCCESS",
+    required: true
+}
 }, {
     timestamps: true
 });
@@ -356,6 +362,11 @@ const withdrawalSchema = new mongoose.Schema({
         required: true,
         unique: true
     },
+    transactionId: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Transaction",
+    default: null
+},
     status: {
         type: String,
         enum: [

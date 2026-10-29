@@ -9,6 +9,7 @@ const {
     User,
     Wallet,
     Transaction,
+    Withdrawal,
     LedgerEntry,
     IdempotencyRecord,
     PaymentOrder,
@@ -695,13 +696,47 @@ router.get("/transactions", authMiddleware, async (req, res) => {
             .skip((page - 1) * limit)
             .limit(limit);
 
+        // Find linked withdrawals belonging to the signed-in user.
+        const withdrawalTransactionIds = transactions
+            .filter(item => item.type === "WITHDRAWAL")
+            .map(item => item._id);
+
+        const withdrawals = withdrawalTransactionIds.length
+            ? await Withdrawal.find({
+                userId: req.userId,
+                transactionId: { $in: withdrawalTransactionIds }
+            })
+                .select("transactionId status")
+                .lean()
+            : [];
+
+        const withdrawalStatusByTransactionId = new Map(
+            withdrawals.map(withdrawal => [
+                withdrawal.transactionId.toString(),
+                withdrawal.status
+            ])
+        );
+
         const formattedTransactions = transactions.map(transaction => {
             const item = transaction.toObject();
 
             switch (item.type) {
-                case "WITHDRAWAL":
+                case "WITHDRAWAL": {
                     item.withWhom = "Withdrawal to bank";
+
+                    // The withdrawal record is the source of truth
+                    // for the current payout status.
+                    const withdrawalStatus =
+                        withdrawalStatusByTransactionId.get(
+                            item._id.toString()
+                        );
+
+                    if (withdrawalStatus) {
+                        item.status = withdrawalStatus;
+                    }
+
                     break;
+                }
 
                 case "REVERSAL":
                     item.withWhom = "Refund of failed withdrawal";
@@ -725,6 +760,7 @@ router.get("/transactions", authMiddleware, async (req, res) => {
                             ? `Transfer from ${item.fromUserId.username}`
                             : "Wallet transfer";
                     }
+
                     break;
 
                 default:

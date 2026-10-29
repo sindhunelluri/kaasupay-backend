@@ -17,7 +17,7 @@ const {
 const authMiddleware = require("../middleware/auth");
 const { verifyPaymentPin } = require("../services/paymentPin");
 const router = express.Router();
-const WITHDRAWALS_PAUSED = true;
+const WITHDRAWALS_PAUSED = true; // Set to true to pause withdrawals temporarily
 
 const withdrawSchema = z.object({
     bankAccountId: z.string().regex(/^[a-f\d]{24}$/i),
@@ -165,21 +165,24 @@ let record;
                 }
 
                 const [withdrawal] = await Withdrawal.create([{
-                    userId: req.userId,
-                    bankAccountId: bankAccount._id,
-                    amount,
-                    reference: `wd_${new mongoose.Types.ObjectId()}`,
-                    status: "PENDING"
-                }], { session });
+    userId: req.userId,
+    bankAccountId: bankAccount._id,
+    amount,
+    reference: `wd_${new mongoose.Types.ObjectId()}`,
+    status: "PENDING"
+}], { session });
 
-                const [transaction] = await Transaction.create([{
-                    type: "WITHDRAWAL",
-                    fromUserId: req.userId,
-                    toUserId: null,
-                    amount,
-                    note: "Withdrawal to bank",
-                    status: "SUCCESS"
-                }], { session });
+const [transaction] = await Transaction.create([{
+    type: "WITHDRAWAL",
+    fromUserId: req.userId,
+    toUserId: null,
+    amount,
+    note: "Withdrawal to bank",
+    status: "PENDING"
+}], { session });
+
+withdrawal.transactionId = transaction._id;
+await withdrawal.save({ session });
 
                 await LedgerEntry.create([{
                     userId: req.userId,
