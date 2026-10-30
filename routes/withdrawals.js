@@ -17,7 +17,7 @@ const {
 const authMiddleware = require("../middleware/auth");
 const { verifyPaymentPin } = require("../services/paymentPin");
 const router = express.Router();
-const WITHDRAWALS_PAUSED = true;
+const WITHDRAWALS_PAUSED = false; // Set to true to pause withdrawals temporarily
 
 const withdrawSchema = z.object({
     bankAccountId: z.string().regex(/^[a-f\d]{24}$/i),
