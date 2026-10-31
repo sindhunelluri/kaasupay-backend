@@ -85,7 +85,9 @@ async function verifyPaymentPin(userId, pin) {
                 }
             }
         ],
-        { returnDocument: "after" }
+        { 
+            updatePipeline: true,
+            returnDocument: "after" }
     ).select("pinFailedAttempts pinLockedUntil");
 
     if (!reserved) {
