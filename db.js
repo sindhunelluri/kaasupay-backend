@@ -15,6 +15,12 @@ async function connectDB() {
         await DailyTransferLimit.init();
         console.log("Daily transfer limit index initialized");
 
+        await RateLimitCounter.init();
+        console.log("Rate limit index initialized");
+
+        await MoneyRequest.init();
+        console.log("Money request indexes initialized");
+
     } catch (error) {
         console.error("MongoDB connection failed:", error.message);
         process.exit(1);
@@ -59,6 +65,13 @@ const userSchema = new mongoose.Schema({
     pinLockedUntil: {
         type: Date,
         default: null
+    },
+    // Raised by "log out of all devices" and by a password change.
+    // Every JWT carries this number as `tv`; a different number = session ended.
+    tokenVersion: {
+        type: Number,
+        default: 0,
+        min: 0
     }
 });
 
@@ -164,7 +177,7 @@ const transactionSchema = new mongoose.Schema({
     note: {
         type: String,
         trim: true,
-        maxlength: 50,
+        maxlength: 110,
         default: ""
     },
     status: {
@@ -282,6 +295,16 @@ const DailyTransferLimit = mongoose.model(
     "DailyTransferLimit",
     dailyTransferLimitSchema
 );
+// Rate limit counters (one document per key per window). Old ones are
+// deleted by MongoDB itself through the TTL index on expiresAt.
+const rateLimitCounterSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true },
+    count: { type: Number, required: true, default: 0 },
+    expiresAt: { type: Date, required: true }
+});
+rateLimitCounterSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+const RateLimitCounter = mongoose.model("RateLimitCounter", rateLimitCounterSchema);
+
 const User = mongoose.model("User", userSchema);
 const Wallet = mongoose.model("Wallet", walletSchema);
 const PaymentOrder = mongoose.model("PaymentOrder", paymentOrderSchema);
@@ -425,10 +448,68 @@ const BankAccount = mongoose.model("BankAccount", bankAccountSchema);
 const Withdrawal = mongoose.model("Withdrawal", withdrawalSchema);
 const OutboxEvent = mongoose.model("OutboxEvent", outboxEventSchema);
 
+// Money request model
+const moneyRequestSchema = new mongoose.Schema({
+    requesterId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    payerId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    amount: {
+        type: Number,
+        required: true,
+        min: 100,
+        max: 1000000,
+        validate: {
+            validator: Number.isInteger,
+            message: "Amount must be an integer in paise"
+        }
+    },
+    note: {
+        type: String,
+        trim: true,
+        maxlength: 100,
+        default: ""
+    },
+    status: {
+        type: String,
+        enum: ["PENDING", "PAID", "DECLINED", "CANCELLED", "EXPIRED"],
+        default: "PENDING",
+        required: true
+    },
+    expiresAt: {
+        type: Date,
+        required: true
+    },
+    transactionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Transaction",
+        default: null
+    },
+    decidedAt: {
+        type: Date,
+        default: null
+    }
+}, {
+    timestamps: true
+});
+
+// Efficient incoming and outgoing request lists
+moneyRequestSchema.index({ payerId: 1, status: 1, createdAt: -1 });
+moneyRequestSchema.index({ requesterId: 1, status: 1, createdAt: -1 });
+
+const MoneyRequest = mongoose.model("MoneyRequest", moneyRequestSchema);
+
 module.exports = {
     connectDB,
     User,
     DailyTransferLimit,
+    RateLimitCounter,
     Wallet,
     PaymentOrder,
     Transaction,
@@ -436,7 +517,8 @@ module.exports = {
     IdempotencyRecord,
     BankAccount,
     Withdrawal,
-    OutboxEvent
+    OutboxEvent,
+    MoneyRequest
 };
 
 

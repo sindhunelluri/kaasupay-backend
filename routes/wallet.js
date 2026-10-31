@@ -4,7 +4,13 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { z } = require("zod");
 const Razorpay = require("razorpay");
+const { transferMoney } = require("../services/transferMoney");
 const { getIndiaDayKey } = require("../utils/indiaDate");
+const {
+    ensureDailyCounter,
+    getDailyUsage
+} = require("../services/dailyLimit");
+const { rateLimit, byUser } = require("../middleware/rateLimit");
 const {
     User,
     Wallet,
@@ -17,7 +23,7 @@ const {
 } = require("../db");
 
 const authMiddleware = require("../middleware/auth");
-const { verifyPaymentPin } = require("../services/paymentPin");
+const { verifyPaymentPin, sendPinFailure } = require("../services/paymentPin");
 
 const router = express.Router();
 
@@ -26,7 +32,8 @@ const razorpay = new Razorpay({
     key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
-const DAILY_TRANSFER_LIMIT = 1_000_000; // ₹10,000 in paise
+// Transfers and withdrawals share ONE money rate limit: 10 per minute per user.
+const moneyLimit = rateLimit({ name: "money", max: 10, windowSeconds: 60, keyFrom: byUser });
 
 
 function createHttpError(status, message) {
@@ -299,7 +306,7 @@ const transferSchema = z.object({
 // TRANSFER MONEY WITH PAYMENT PIN AND DAILY LIMIT
 // --------------------------------------------------
 
-router.post("/transfer", authMiddleware, async (req, res) => {
+router.post("/transfer", authMiddleware, moneyLimit, async (req, res) => {
     const key = req.get("Idempotency-Key");
 
     if (
@@ -337,31 +344,7 @@ router.post("/transfer", authMiddleware, async (req, res) => {
         });
     }
 
-    if (!pinResult.ok) {
-        if (pinResult.status === "PIN_NOT_SET") {
-            return res.status(400).json({
-                error: "Set your payment PIN first"
-            });
-        }
-
-        if (pinResult.status === "PIN_LOCKED") {
-            return res.status(423).json({
-                error: "Payment PIN is temporarily locked",
-                retryAfterSeconds: pinResult.retryAfterSeconds
-            });
-        }
-
-        if (pinResult.status === "PIN_RETRY") {
-            return res.status(409).json({
-                error: "PIN verification conflicted with another request. Try again."
-            });
-        }
-
-        return res.status(401).json({
-            error: "Incorrect payment PIN",
-            attemptsRemaining: pinResult.attemptsRemaining
-        });
-    }
+    if (sendPinFailure(res, pinResult)) return;
 
     const { to, amount, note } = result.data;
     const cleanNote = note || "Wallet transfer";
@@ -437,163 +420,57 @@ router.post("/transfer", authMiddleware, async (req, res) => {
             );
         }
 
+        // Make sure today's counter exists (outside the transaction).
+        await ensureDailyCounter(sender._id);
+
         const session = await mongoose.startSession();
         let responseData;
 
         try {
             await session.withTransaction(async () => {
-                const dayKey = getIndiaDayKey();
+    const movement = await transferMoney({
+        fromUser: sender,
+        toUser: receiver,
+        amount,
+        note: cleanNote,
+        session
+    });
 
-                // Ensure a daily counter exists for this sender.
-                // The unique { userId, dayKey } index prevents duplicate
-                // counter documents for the same sender and date.
-                await DailyTransferLimit.updateOne(
-                    {
-                        userId: sender._id,
-                        dayKey
-                    },
-                    {
-                        $setOnInsert: {
-                            userId: sender._id,
-                            dayKey,
-                            totalAmount: 0
-                        }
-                    },
-                    {
-                        upsert: true,
-                        session
-                    }
-                );
+    responseData = {
+        message: "Transfer successful",
+        transactionId: movement.transaction._id,
+        from: sender.username,
+        to: receiver.username,
+        amount,
+        senderBalance: movement.senderBalance,
+        receiverBalance: movement.receiverBalance,
+        note: cleanNote
+    };
 
-                // Atomically reserve the amount only when it will not
-                // push the daily total over ₹10,000.
-                const dailyLimitRecord =
-                    await DailyTransferLimit.findOneAndUpdate(
-                        {
-                            userId: sender._id,
-                            dayKey,
-                            totalAmount: {
-                                $lte: DAILY_TRANSFER_LIMIT - amount
-                            }
-                        },
-                        {
-                            $inc: {
-                                totalAmount: amount
-                            }
-                        },
-                        {
-                            returnDocument: "after",
-                            session
-                        }
-                    );
-
-                if (!dailyLimitRecord) {
-                    throw createHttpError(
-                        429,
-                        "Daily transfer limit of ₹10,000 exceeded"
-                    );
+    // Save the success response in the same transaction.
+    const updated = await IdempotencyRecord.updateOne(
+        {
+            _id: record._id,
+            status: "IN_PROGRESS"
+        },
+        {
+            $set: {
+                status: "DONE",
+                response: {
+                    httpStatus: 200,
+                    body: responseData
                 }
+            }
+        },
+        { session }
+    );
 
-                // Debit the sender only if their balance is sufficient.
-                const senderWallet = await Wallet.findOneAndUpdate(
-                    {
-                        userId: sender._id,
-                        balance: { $gte: amount }
-                    },
-                    {
-                        $inc: { balance: -amount }
-                    },
-                    {
-                        returnDocument: "after",
-                        session
-                    }
-                );
-
-                if (!senderWallet) {
-                    throw createHttpError(
-                        400,
-                        "Insufficient balance"
-                    );
-                }
-
-                const receiverWallet = await Wallet.findOneAndUpdate(
-                    { userId: receiver._id },
-                    {
-                        $inc: { balance: amount }
-                    },
-                    {
-                        returnDocument: "after",
-                        session
-                    }
-                );
-
-                if (!receiverWallet) {
-                    throw createHttpError(
-                        404,
-                        "Recipient wallet not found"
-                    );
-                }
-
-                const [transaction] = await Transaction.create([{
-                    type: "TRANSFER",
-                    fromUserId: sender._id,
-                    toUserId: receiver._id,
-                    amount,
-                    note: cleanNote,
-                    status: "SUCCESS"
-                }], { session });
-
-                await LedgerEntry.create([{
-                    userId: sender._id,
-                    transactionId: transaction._id,
-                    direction: "DEBIT",
-                    amount,
-                    balanceAfter: senderWallet.balance
-                }], { session });
-
-                await LedgerEntry.create([{
-                    userId: receiver._id,
-                    transactionId: transaction._id,
-                    direction: "CREDIT",
-                    amount,
-                    balanceAfter: receiverWallet.balance
-                }], { session });
-
-                responseData = {
-                    message: "Transfer successful",
-                    transactionId: transaction._id,
-                    from: sender.username,
-                    to: receiver.username,
-                    amount,
-                    senderBalance: senderWallet.balance,
-                    receiverBalance: receiverWallet.balance,
-                    note: cleanNote
-                };
-
-                // Save the success response in the same transaction.
-                const updated = await IdempotencyRecord.updateOne(
-                    {
-                        _id: record._id,
-                        status: "IN_PROGRESS"
-                    },
-                    {
-                        $set: {
-                            status: "DONE",
-                            response: {
-                                httpStatus: 200,
-                                body: responseData
-                            }
-                        }
-                    },
-                    { session }
-                );
-
-                if (updated.modifiedCount !== 1) {
-                    throw new Error(
-                        "Could not save idempotency response"
-                    );
-                }
-            });
+    if (updated.modifiedCount !== 1) {
+        throw new Error(
+            "Could not save idempotency response"
+        );
+    }
+});
         } finally {
             await session.endSession();
         }
@@ -608,7 +485,11 @@ router.post("/transfer", authMiddleware, async (req, res) => {
             record &&
             [400, 404, 429].includes(error.status)
         ) {
-            const body = { error: error.message };
+            const body = {
+                error: error.message,
+                message: error.message,
+                ...(error.extra || {})
+            };
 
             try {
                 await IdempotencyRecord.updateOne(
@@ -661,6 +542,15 @@ router.post("/transfer", authMiddleware, async (req, res) => {
 // --------------------------------------------------
 // TRANSACTION HISTORY
 // --------------------------------------------------
+
+router.get("/limits", authMiddleware, async (req, res) => {
+    try {
+        return res.status(200).json(await getDailyUsage(req.userId));
+    } catch (error) {
+        console.error("Limits error:", error.message);
+        return res.status(500).json({ error: "Could not load limits" });
+    }
+});
 
 router.get("/transactions", authMiddleware, async (req, res) => {
     try {

@@ -1,3 +1,4 @@
+
 require("dotenv").config();
 
 const mongoose = require("mongoose");
@@ -9,18 +10,27 @@ async function connectTestDB() {
         throw new Error("MONGO_URL is missing from .env");
     }
 
-    const testUri = uri.replace(
-        /\/kaasupay(?=\?|$)/,
-        "/kaasupay_test"
-    );
+    const databaseName = new URL(uri).pathname.replace(/^\/+/, "");
 
-    if (testUri === uri) {
+    let testUri;
+
+    if (databaseName === "kaasupay_test") {
+        // Already using the isolated test database.
+        testUri = uri;
+    } else if (databaseName === "kaasupay") {
+        // Convert the development database to the test database.
+        testUri = uri.replace(
+            /\/kaasupay(?=\?|$)/,
+            "/kaasupay_test"
+        );
+    } else {
         throw new Error(
-            "Could not identify the kaasupay database in MONGO_URL. No connection was made."
+            `Unsafe database name: ${databaseName}. No connection was made.`
         );
     }
 
     await mongoose.connect(testUri);
+
     console.log("Connected to isolated kaasupay_test database");
 }
 

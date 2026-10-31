@@ -29,6 +29,24 @@ function adminMiddleware(req, res, next) {
     next();
 }
 
+// POST /api/v1/admin/users/:id/unlock-pin  (staff only)
+router.post("/users/:id/unlock-pin", adminMiddleware, async (req, res) => {
+    if (!mongoose.isValidObjectId(req.params.id)) {
+        return res.status(400).json({ error: "Invalid user id" });
+    }
+
+    const result = await User.updateOne(
+        { _id: req.params.id },
+        { $set: { pinFailedAttempts: 0, pinLockedUntil: null } }
+    );
+
+    if (result.matchedCount === 0) {
+        return res.status(404).json({ error: "User not found" });
+    }
+
+    return res.status(200).json({ message: "PIN unlocked" });
+});
+
 // POST /api/v1/admin/deposit
 router.post("/deposit", adminMiddleware, async (req, res) => {
     const result = depositSchema.safeParse(req.body);
