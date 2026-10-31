@@ -7,6 +7,10 @@ const cors = require("cors");
 
 const app = express();
 
+// Behind Render / Railway / NGINX every request looks like it comes from the
+// proxy. This makes req.ip the real client IP, so IP rate limits work.
+app.set("trust proxy", 1);
+
 app.use(cors({
     origin: [
         "http://localhost:5173",
@@ -17,7 +21,9 @@ app.use(cors({
         "Content-Type",
         "Authorization",
         "idempotency-key"
-    ]
+    ],
+    // lets the frontend read these headers
+    exposedHeaders: ["Retry-After", "X-RateLimit-Limit", "X-RateLimit-Remaining"]
 }));
 
 // Preserve raw request body for Razorpay webhook verification.

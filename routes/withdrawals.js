@@ -15,7 +15,12 @@ const {
 } = require("../db");
 
 const authMiddleware = require("../middleware/auth");
-const { verifyPaymentPin } = require("../services/paymentPin");
+const { verifyPaymentPin, sendPinFailure } = require("../services/paymentPin");
+const { ensureDailyCounter, reserveDailyLimit } = require("../services/dailyLimit");
+const { rateLimit, byUser } = require("../middleware/rateLimit");
+
+// Same name as the transfer route, so both routes share one counter.
+const moneyLimit = rateLimit({ name: "money", max: 10, windowSeconds: 60, keyFrom: byUser });
 const router = express.Router();
 const WITHDRAWALS_PAUSED = false; // Set to true to pause withdrawals temporarily
 
@@ -26,7 +31,7 @@ const withdrawSchema = z.object({
 });
 
 // POST /api/v1/wallet/withdraw
-router.post("/", authMiddleware, async (req, res) => {
+router.post("/", authMiddleware, moneyLimit, async (req, res) => {
     if (WITHDRAWALS_PAUSED) {
         return res.status(503).json({
             error: "Withdrawals are temporarily paused. Please try again later."
@@ -64,31 +69,7 @@ try {
     });
 }
 
-if (!pinResult.ok) {
-    if (pinResult.status === "PIN_NOT_SET") {
-        return res.status(400).json({
-            error: "Set your payment PIN first"
-        });
-    }
-
-    if (pinResult.status === "PIN_LOCKED") {
-        return res.status(423).json({
-            error: "Payment PIN is temporarily locked",
-            retryAfterSeconds: pinResult.retryAfterSeconds
-        });
-    }
-
-    if (pinResult.status === "PIN_RETRY") {
-        return res.status(409).json({
-            error: "PIN verification conflicted with another request. Try again."
-        });
-    }
-
-    return res.status(401).json({
-        error: "Incorrect payment PIN",
-        attemptsRemaining: pinResult.attemptsRemaining
-    });
-}
+if (sendPinFailure(res, pinResult)) return;
 
 const requestHash = crypto
     .createHash("sha256")
@@ -143,11 +124,17 @@ let record;
             throw error;
         }
 
+        // Make sure today's counter exists (outside the transaction).
+        await ensureDailyCounter(req.userId);
+
         const session = await mongoose.startSession();
         let responseData;
 
         try {
             await session.withTransaction(async () => {
+                // Daily limit: counts with transfers, rolls back with this transaction.
+                await reserveDailyLimit(req.userId, amount, session);
+
                 // Atomically debit only when sufficient funds exist.
                 const wallet = await Wallet.findOneAndUpdate(
                     {
@@ -235,7 +222,11 @@ let record;
         console.error("Withdrawal request error:", error.message);
 
         if (record && [400, 404].includes(error.status)) {
-            const body = { error: error.message };
+            const body = {
+                error: error.message,
+                message: error.message,
+                ...(error.extra || {})
+            };
 
             try {
                 await IdempotencyRecord.updateOne(

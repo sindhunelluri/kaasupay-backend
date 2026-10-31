@@ -1,4 +1,3 @@
-
 const express = require("express");
 const { z } = require("zod");
 const bcrypt = require("bcryptjs");
@@ -7,7 +6,27 @@ const jwt = require("jsonwebtoken");
 const { User, Wallet } = require("../db");
 const { JWT_SECRET } = require("../config");
 const authMiddleware = require("../middleware/auth");
-const { verifyPaymentPin } = require("../services/paymentPin");
+const {
+    verifyPaymentPin,
+    sendPinFailure,
+    pinProblem
+} = require("../services/paymentPin");
+const { rateLimit, byIp, byUser, byEmail } = require("../middleware/rateLimit");
+
+// Rate limits (Day 6)
+const signupIpLimit = rateLimit({ name: "signup-ip", max: 10, windowSeconds: 3600, keyFrom: byIp });
+const signinIpLimit = rateLimit({ name: "signin-ip", max: 20, windowSeconds: 60, keyFrom: byIp });
+const signinEmailLimit = rateLimit({ name: "signin-email", max: 5, windowSeconds: 60, keyFrom: byEmail });
+const passwordChangeLimit = rateLimit({ name: "password-change", max: 5, windowSeconds: 3600, keyFrom: byUser });
+const pinSetupLimit = rateLimit({ name: "pin-setup", max: 5, windowSeconds: 3600, keyFrom: byUser });
+
+function makeToken(user) {
+    return jwt.sign(
+        { userId: user._id.toString(), tv: user.tokenVersion ?? 0 },
+        JWT_SECRET,
+        { expiresIn: "1h" }
+    );
+}
 
 const router = express.Router();
 
@@ -47,7 +66,7 @@ const signupSchema = z.object({
 // --------------------
 // SIGNUP
 // --------------------
-router.post("/signup", async (req, res) => {
+router.post("/signup", signupIpLimit, async (req, res) => {
     try {
         const result = signupSchema.safeParse(req.body);
 
@@ -124,7 +143,7 @@ const signinSchema = z.object({
 // --------------------
 // SIGNIN
 // --------------------
-router.post("/signin", async (req, res) => {
+router.post("/signin", signinIpLimit, signinEmailLimit, async (req, res) => {
     const requestStart = Date.now();
 
     try {
@@ -173,11 +192,7 @@ router.post("/signin", async (req, res) => {
 
         const jwtStart = Date.now();
 
-        const token = jwt.sign(
-            { userId: user._id.toString() },
-            JWT_SECRET,
-            { expiresIn: "1h" }
-        );
+        const token = makeToken(user);
 
         const jwtMs = Date.now() - jwtStart;
 
@@ -220,6 +235,7 @@ router.get("/me", authMiddleware, async (req, res) => {
                 firstName: user.firstName,
                 lastName: user.lastName,
                 hasPaymentPin: Boolean(user.paymentPinHash),
+                hasPin: Boolean(user.paymentPinHash),
             },
         });
     } catch (error) {
@@ -236,10 +252,7 @@ router.get("/me", authMiddleware, async (req, res) => {
 // --------------------
 const paymentPinSchema = z.object({
     password: z.string().min(1),
-    pin: z.string().regex(
-        /^\d{4,6}$/,
-        "PIN must contain 4 to 6 digits"
-    ),
+    pin: z.string(),
 });
 
 // --------------------
@@ -256,6 +269,11 @@ router.post("/payment-pin", authMiddleware, async (req, res) => {
 
     try {
         const { password, pin } = parsed.data;
+
+        const problem = pinProblem(pin);
+        if (problem) {
+            return res.status(400).json({ error: problem, message: problem });
+        }
 
         const user = await User.findById(req.userId)
             .select("+paymentPinHash");
@@ -344,34 +362,10 @@ router.post("/payment-pin/verify", authMiddleware, async (req, res) => {
             parsed.data.pin
         );
 
-        if (result.ok) {
-            return res.status(200).json({
-                message: "Payment PIN verified successfully",
-            });
-        }
+        if (sendPinFailure(res, result)) return;
 
-        if (result.status === "PIN_NOT_SET") {
-            return res.status(400).json({
-                error: "Set your payment PIN first",
-            });
-        }
-
-        if (result.status === "PIN_LOCKED") {
-            return res.status(423).json({
-                error: "Payment PIN is temporarily locked",
-                retryAfterSeconds: result.retryAfterSeconds,
-            });
-        }
-
-        if (result.status === "PIN_RETRY") {
-            return res.status(409).json({
-                error: "PIN verification conflicted with another request. Try again.",
-            });
-        }
-
-        return res.status(401).json({
-            error: "Incorrect payment PIN",
-            attemptsRemaining: result.attemptsRemaining,
+        return res.status(200).json({
+            message: "Payment PIN verified successfully",
         });
     } catch (error) {
         console.error("Payment PIN verification error:", error);
@@ -379,6 +373,134 @@ router.post("/payment-pin/verify", authMiddleware, async (req, res) => {
         return res.status(500).json({
             error: "Could not verify Payment PIN",
         });
+    }
+});
+
+// --------------------
+// SET OR CHANGE PIN  (POST /api/v1/user/pin)
+// --------------------
+const setPinSchema = z.object({
+    password: z.string().min(1),
+    pin: z.string(),
+});
+
+router.post("/pin", authMiddleware, pinSetupLimit, async (req, res) => {
+    const parsed = setPinSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+        return res.status(400).json({
+            error: "password and pin are required",
+            message: "password and pin are required",
+        });
+    }
+
+    const { password, pin } = parsed.data;
+
+    const problem = pinProblem(pin);
+    if (problem) {
+        return res.status(400).json({ error: problem, message: problem });
+    }
+
+    try {
+        const user = await User.findById(req.userId).select("+paymentPinHash passwordHash");
+
+        if (!user) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        const passwordOk = await bcrypt.compare(password, user.passwordHash);
+        if (!passwordOk) {
+            return res.status(401).json({ error: "Wrong password", message: "Wrong password" });
+        }
+
+        const hadPin = Boolean(user.paymentPinHash);
+        const paymentPinHash = await bcrypt.hash(pin, 10);
+
+        await User.updateOne(
+            { _id: req.userId },
+            { $set: { paymentPinHash, pinFailedAttempts: 0, pinLockedUntil: null } }
+        );
+
+        const text = hadPin ? "PIN changed" : "PIN set";
+        return res.status(200).json({ message: text });
+    } catch (error) {
+        console.error("Set PIN error:", error.message);
+        return res.status(500).json({ error: "Could not save PIN" });
+    }
+});
+
+// --------------------
+// LOG OUT OF ALL DEVICES
+// --------------------
+router.post("/logout-all", authMiddleware, async (req, res) => {
+    try {
+        await User.updateOne({ _id: req.userId }, { $inc: { tokenVersion: 1 } });
+
+        return res.status(200).json({ message: "Signed out on all devices" });
+    } catch (error) {
+        console.error("Logout-all error:", error.message);
+        return res.status(500).json({ error: "Could not sign you out" });
+    }
+});
+
+// --------------------
+// CHANGE PASSWORD (ends every old session, returns a fresh token)
+// --------------------
+const changePasswordSchema = z.object({
+    username: z.string().trim().toLowerCase().email("must be a valid email"),
+    oldPassword: z.string().min(1, "is required"),
+    newPassword: z.string().min(6, "must be at least 6 characters"),
+});
+
+router.put("/", authMiddleware, passwordChangeLimit, async (req, res) => {
+    const parsed = changePasswordSchema.safeParse(req.body);
+
+    if (!parsed.success) {
+        const text = firstError(parsed.error);
+        return res.status(400).json({ error: text, message: text });
+    }
+
+    const { username, oldPassword, newPassword } = parsed.data;
+
+    try {
+        const account = await User.findById(req.userId).select("username passwordHash");
+
+        if (!account) {
+            return res.status(404).json({ error: "User not found" });
+        }
+
+        // The email must be the one for the account that is signed in.
+        if (account.username !== username) {
+            const text = "Email does not match your account";
+            return res.status(400).json({ error: text, message: text });
+        }
+
+        const oldOk = await bcrypt.compare(oldPassword, account.passwordHash);
+        if (!oldOk) {
+            const text = "Old password is wrong";
+            return res.status(401).json({ error: text, message: text });
+        }
+
+        if (oldPassword === newPassword) {
+            const text = "New password must be different from the old one";
+            return res.status(400).json({ error: text, message: text });
+        }
+
+        const passwordHash = await bcrypt.hash(newPassword, 10);
+
+        const user = await User.findByIdAndUpdate(
+            req.userId,
+            { $set: { passwordHash }, $inc: { tokenVersion: 1 } },
+            { returnDocument: "after" }
+        );
+
+        return res.status(200).json({
+            message: "Password changed. You are signed out on all devices",
+            token: makeToken(user),
+        });
+    } catch (error) {
+        console.error("Change password error:", error.message);
+        return res.status(500).json({ error: "Could not change password" });
     }
 });
 

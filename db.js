@@ -15,6 +15,9 @@ async function connectDB() {
         await DailyTransferLimit.init();
         console.log("Daily transfer limit index initialized");
 
+        await RateLimitCounter.init();
+        console.log("Rate limit index initialized");
+
     } catch (error) {
         console.error("MongoDB connection failed:", error.message);
         process.exit(1);
@@ -59,6 +62,13 @@ const userSchema = new mongoose.Schema({
     pinLockedUntil: {
         type: Date,
         default: null
+    },
+    // Raised by "log out of all devices" and by a password change.
+    // Every JWT carries this number as `tv`; a different number = session ended.
+    tokenVersion: {
+        type: Number,
+        default: 0,
+        min: 0
     }
 });
 
@@ -282,6 +292,16 @@ const DailyTransferLimit = mongoose.model(
     "DailyTransferLimit",
     dailyTransferLimitSchema
 );
+// Rate limit counters (one document per key per window). Old ones are
+// deleted by MongoDB itself through the TTL index on expiresAt.
+const rateLimitCounterSchema = new mongoose.Schema({
+    key: { type: String, required: true, unique: true },
+    count: { type: Number, required: true, default: 0 },
+    expiresAt: { type: Date, required: true }
+});
+rateLimitCounterSchema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
+const RateLimitCounter = mongoose.model("RateLimitCounter", rateLimitCounterSchema);
+
 const User = mongoose.model("User", userSchema);
 const Wallet = mongoose.model("Wallet", walletSchema);
 const PaymentOrder = mongoose.model("PaymentOrder", paymentOrderSchema);
@@ -429,6 +449,7 @@ module.exports = {
     connectDB,
     User,
     DailyTransferLimit,
+    RateLimitCounter,
     Wallet,
     PaymentOrder,
     Transaction,
