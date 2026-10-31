@@ -9,8 +9,11 @@ if (!JWT_SECRET) {
 // Most money that can leave one wallet in one India day (paise).
 // Sends and withdrawals count together. Change it here only.
 const DAILY_SEND_LIMIT = 1_000_000; // ₹10,000
+// Money requests expire after seven days.
+const REQUEST_EXPIRY_DAYS = 7;
 
 module.exports = {
     JWT_SECRET,
-    DAILY_SEND_LIMIT
+    DAILY_SEND_LIMIT,
+    REQUEST_EXPIRY_DAYS
 };

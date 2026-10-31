@@ -4,10 +4,10 @@ const mongoose = require("mongoose");
 const crypto = require("crypto");
 const { z } = require("zod");
 const Razorpay = require("razorpay");
+const { transferMoney } = require("../services/transferMoney");
 const { getIndiaDayKey } = require("../utils/indiaDate");
 const {
     ensureDailyCounter,
-    reserveDailyLimit,
     getDailyUsage
 } = require("../services/dailyLimit");
 const { rateLimit, byUser } = require("../middleware/rateLimit");
@@ -428,110 +428,49 @@ router.post("/transfer", authMiddleware, moneyLimit, async (req, res) => {
 
         try {
             await session.withTransaction(async () => {
-                // Daily limit: add to today's counter only if it still fits.
-                // It lives in this transaction, so a failure below rolls it back.
-                await reserveDailyLimit(sender._id, amount, session);
+    const movement = await transferMoney({
+        fromUser: sender,
+        toUser: receiver,
+        amount,
+        note: cleanNote,
+        session
+    });
 
-                // Debit the sender only if their balance is sufficient.
-                const senderWallet = await Wallet.findOneAndUpdate(
-                    {
-                        userId: sender._id,
-                        balance: { $gte: amount }
-                    },
-                    {
-                        $inc: { balance: -amount }
-                    },
-                    {
-                        returnDocument: "after",
-                        session
-                    }
-                );
+    responseData = {
+        message: "Transfer successful",
+        transactionId: movement.transaction._id,
+        from: sender.username,
+        to: receiver.username,
+        amount,
+        senderBalance: movement.senderBalance,
+        receiverBalance: movement.receiverBalance,
+        note: cleanNote
+    };
 
-                if (!senderWallet) {
-                    throw createHttpError(
-                        400,
-                        "Insufficient balance"
-                    );
+    // Save the success response in the same transaction.
+    const updated = await IdempotencyRecord.updateOne(
+        {
+            _id: record._id,
+            status: "IN_PROGRESS"
+        },
+        {
+            $set: {
+                status: "DONE",
+                response: {
+                    httpStatus: 200,
+                    body: responseData
                 }
+            }
+        },
+        { session }
+    );
 
-                const receiverWallet = await Wallet.findOneAndUpdate(
-                    { userId: receiver._id },
-                    {
-                        $inc: { balance: amount }
-                    },
-                    {
-                        returnDocument: "after",
-                        session
-                    }
-                );
-
-                if (!receiverWallet) {
-                    throw createHttpError(
-                        404,
-                        "Recipient wallet not found"
-                    );
-                }
-
-                const [transaction] = await Transaction.create([{
-                    type: "TRANSFER",
-                    fromUserId: sender._id,
-                    toUserId: receiver._id,
-                    amount,
-                    note: cleanNote,
-                    status: "SUCCESS"
-                }], { session });
-
-                await LedgerEntry.create([{
-                    userId: sender._id,
-                    transactionId: transaction._id,
-                    direction: "DEBIT",
-                    amount,
-                    balanceAfter: senderWallet.balance
-                }], { session });
-
-                await LedgerEntry.create([{
-                    userId: receiver._id,
-                    transactionId: transaction._id,
-                    direction: "CREDIT",
-                    amount,
-                    balanceAfter: receiverWallet.balance
-                }], { session });
-
-                responseData = {
-                    message: "Transfer successful",
-                    transactionId: transaction._id,
-                    from: sender.username,
-                    to: receiver.username,
-                    amount,
-                    senderBalance: senderWallet.balance,
-                    receiverBalance: receiverWallet.balance,
-                    note: cleanNote
-                };
-
-                // Save the success response in the same transaction.
-                const updated = await IdempotencyRecord.updateOne(
-                    {
-                        _id: record._id,
-                        status: "IN_PROGRESS"
-                    },
-                    {
-                        $set: {
-                            status: "DONE",
-                            response: {
-                                httpStatus: 200,
-                                body: responseData
-                            }
-                        }
-                    },
-                    { session }
-                );
-
-                if (updated.modifiedCount !== 1) {
-                    throw new Error(
-                        "Could not save idempotency response"
-                    );
-                }
-            });
+    if (updated.modifiedCount !== 1) {
+        throw new Error(
+            "Could not save idempotency response"
+        );
+    }
+});
         } finally {
             await session.endSession();
         }

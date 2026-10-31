@@ -8,6 +8,7 @@ const walletRouter = require("./wallet");
 const withdrawalsRouter = require("./withdrawals");
 const payoutRouter = require("./payout");
 const webhookRouter = require("./webhook");
+const requestsRouter = require("./requests");
 
 // Every URL starting with /api/v1/user
 // will go to routes/user.js
@@ -17,6 +18,7 @@ router.use("/payout", payoutRouter);
 router.use("/webhooks", webhookRouter);
 router.use("/wallet", walletRouter);
 router.use("/wallet/withdraw", withdrawalsRouter);
+router.use("/requests", requestsRouter);
 
 // router.use("/wallet", walletRouter);
 

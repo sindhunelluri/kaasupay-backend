@@ -18,6 +18,9 @@ async function connectDB() {
         await RateLimitCounter.init();
         console.log("Rate limit index initialized");
 
+        await MoneyRequest.init();
+        console.log("Money request indexes initialized");
+
     } catch (error) {
         console.error("MongoDB connection failed:", error.message);
         process.exit(1);
@@ -174,7 +177,7 @@ const transactionSchema = new mongoose.Schema({
     note: {
         type: String,
         trim: true,
-        maxlength: 50,
+        maxlength: 110,
         default: ""
     },
     status: {
@@ -445,6 +448,63 @@ const BankAccount = mongoose.model("BankAccount", bankAccountSchema);
 const Withdrawal = mongoose.model("Withdrawal", withdrawalSchema);
 const OutboxEvent = mongoose.model("OutboxEvent", outboxEventSchema);
 
+// Money request model
+const moneyRequestSchema = new mongoose.Schema({
+    requesterId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    payerId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    amount: {
+        type: Number,
+        required: true,
+        min: 100,
+        max: 1000000,
+        validate: {
+            validator: Number.isInteger,
+            message: "Amount must be an integer in paise"
+        }
+    },
+    note: {
+        type: String,
+        trim: true,
+        maxlength: 100,
+        default: ""
+    },
+    status: {
+        type: String,
+        enum: ["PENDING", "PAID", "DECLINED", "CANCELLED", "EXPIRED"],
+        default: "PENDING",
+        required: true
+    },
+    expiresAt: {
+        type: Date,
+        required: true
+    },
+    transactionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Transaction",
+        default: null
+    },
+    decidedAt: {
+        type: Date,
+        default: null
+    }
+}, {
+    timestamps: true
+});
+
+// Efficient incoming and outgoing request lists
+moneyRequestSchema.index({ payerId: 1, status: 1, createdAt: -1 });
+moneyRequestSchema.index({ requesterId: 1, status: 1, createdAt: -1 });
+
+const MoneyRequest = mongoose.model("MoneyRequest", moneyRequestSchema);
+
 module.exports = {
     connectDB,
     User,
@@ -457,7 +517,8 @@ module.exports = {
     IdempotencyRecord,
     BankAccount,
     Withdrawal,
-    OutboxEvent
+    OutboxEvent,
+    MoneyRequest
 };
 
 
